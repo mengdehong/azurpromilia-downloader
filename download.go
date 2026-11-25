@@ -12,6 +12,7 @@ import (
 	"io"
 	"math"
 	"net/http"
+	"net/url"
 	"os"
 	"path"
 	"slices"
@@ -45,12 +46,13 @@ type downloadOptions struct {
 }
 
 type downloader struct {
-	client    *http.Client
-	root      *os.Root
-	limit     *rateLimit
-	retries   *retryWindows
-	transfers chan struct{}
-	options   downloadOptions
+	client       *http.Client
+	root         *os.Root
+	limit        *rateLimit
+	retries      *retryWindows
+	transfers    chan struct{}
+	options      downloadOptions
+	preferredCDN string
 }
 
 var (
@@ -164,6 +166,10 @@ func downloadPlanned(ctx context.Context, out io.Writer, client *http.Client, ro
 		retries: &retryWindows{until: make(map[string]time.Time)},
 		// Share request slots between whole files and their range requests.
 		transfers: make(chan struct{}, transferSlots),
+	}
+	d.preferredCDN = d.selectCDN(ctx, p.Jobs)
+	if d.preferredCDN != "" {
+		fmt.Fprintln(out, "Using download CDN", d.preferredCDN)
 	}
 	var large, regular fileQueue
 	for i := range p.Jobs {
@@ -299,6 +305,7 @@ func (d downloader) file(ctx context.Context, job planFile, stageOnly bool, prog
 		}
 		progress.localFallback.Store(true)
 	}
+	f = f.preferCDN(d.preferredCDN)
 	for attempt := 0; ; attempt++ {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -315,6 +322,91 @@ func (d downloader) file(ctx context.Context, job planFile, stageOnly bool, prog
 			return err
 		}
 	}
+}
+
+func (d downloader) selectCDN(ctx context.Context, jobs []planFile) string {
+	var sample resource
+	for i := range jobs {
+		job := &jobs[i]
+		if job.Bytes > 0 && len(job.File.Mirrors) > 0 && job.File.Size > sample.Size {
+			sample = job.File
+		}
+	}
+	if sample.Size == 0 {
+		return ""
+	}
+
+	addresses := append([]string{sample.URL}, sample.Mirrors...)
+	length := min(sample.Size, 512<<10)
+	if limit := d.limit.bytesPerSecond; limit > 0 {
+		length = min(length, max(1, limit/int64(len(addresses))))
+	}
+	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	var probes sync.WaitGroup
+	defer func() {
+		cancel()
+		probes.Wait()
+	}()
+	results := make(chan string, len(addresses))
+	for _, address := range addresses {
+		probes.Go(func() { results <- d.probeCDN(ctx, address, sample.Size, length) })
+	}
+	// All probes request the same bytes. The first valid response to finish wins.
+	for range addresses {
+		if origin := <-results; origin != "" {
+			return origin
+		}
+	}
+	return ""
+}
+
+func (d downloader) probeCDN(ctx context.Context, address string, size, length int64) string {
+	reqCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, address, nil)
+	if err != nil {
+		return ""
+	}
+	req.Header.Set("Accept-Encoding", "identity")
+	req.Header.Set("Range", fmt.Sprintf("bytes=0-%d", length-1))
+	resp, err := d.client.Do(req)
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+	origin := transferOrigin(req.URL)
+	if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == http.StatusServiceUnavailable {
+		d.retries.record(origin, resp.Header.Get("Retry-After"))
+	}
+	first, last, total, valid := parseContentRange(resp.Header.Get("Content-Range"))
+	if resp.StatusCode != http.StatusPartialContent || !valid || first != 0 || last != length-1 || total != size {
+		return ""
+	}
+	var received atomic.Int64
+	body := d.newResponseReader(reqCtx, resp.Body, cancel, &received)
+	defer body.idle.Stop()
+	if n, err := io.Copy(io.Discard, io.LimitReader(body, length+1)); err != nil || n != length {
+		return ""
+	}
+	return origin
+}
+
+func (f resource) preferCDN(origin string) resource {
+	if origin == "" || len(f.Mirrors) == 0 {
+		return f
+	}
+	if u, err := url.Parse(f.URL); err == nil && transferOrigin(u) == origin {
+		return f
+	}
+	for i, address := range f.Mirrors {
+		if u, err := url.Parse(address); err == nil && transferOrigin(u) == origin {
+			f.Mirrors = slices.Clone(f.Mirrors)
+			copy(f.Mirrors[1:i+1], f.Mirrors[:i])
+			f.URL, f.Mirrors[0] = address, f.URL
+			break
+		}
+	}
+	return f
 }
 
 func (d downloader) stageLocal(ctx context.Context, f resource, part, source string) (bool, error) {
@@ -672,7 +764,7 @@ func (d downloader) transferRange(ctx context.Context, f resource, piece filePar
 	} else if offset > 0 {
 		req.Header.Set("Range", fmt.Sprintf("bytes=%d-", offset))
 	}
-	origin := req.URL.Scheme + "://" + strings.ToLower(req.URL.Host)
+	origin := transferOrigin(req.URL)
 	if err := d.acquireTransfer(ctx, origin); err != nil {
 		return rangeResult{}, false, err
 	}
@@ -725,13 +817,8 @@ func (d downloader) transferRange(ctx context.Context, f resource, piece filePar
 	if restart {
 		progress.saved.Store(0)
 	}
-	idle := time.AfterFunc(time.Hour, cancel)
-	idle.Stop()
-	defer idle.Stop()
-	body := responseReader{
-		ctx: reqCtx, body: resp.Body, idle: idle, limit: d.limit,
-		bytes: &progress.received,
-	}
+	body := d.newResponseReader(reqCtx, resp.Body, cancel, &progress.received)
+	defer body.idle.Stop()
 	var digest hash.Hash
 	var output io.Writer = progressWriter{dst, &progress.saved}
 	if resp.StatusCode == http.StatusOK {
@@ -761,6 +848,10 @@ func (d downloader) transferRange(ctx context.Context, f resource, piece filePar
 		return rangeResult{}, true, errChecksum
 	}
 	return rangeResult{offset: end - piece.start, verified: digest != nil}, false, nil
+}
+
+func transferOrigin(u *url.URL) string {
+	return u.Scheme + "://" + strings.ToLower(u.Host)
 }
 
 func (d downloader) acquireTransfer(ctx context.Context, origin string) error {
@@ -865,6 +956,12 @@ type responseReader struct {
 	idle  *time.Timer
 	limit *rateLimit
 	bytes *atomic.Int64
+}
+
+func (d downloader) newResponseReader(ctx context.Context, body io.Reader, cancel context.CancelFunc, received *atomic.Int64) responseReader {
+	idle := time.AfterFunc(time.Hour, cancel)
+	idle.Stop()
+	return responseReader{ctx: ctx, body: body, idle: idle, limit: d.limit, bytes: received}
 }
 
 func (r responseReader) Read(buffer []byte) (int, error) {
