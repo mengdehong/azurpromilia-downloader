@@ -25,6 +25,10 @@ const (
 	installState  = stageDir + "/install.json"
 	installRecord = stageDir + "/installed.json"
 	installBackup = stageDir + "/install-backup"
+	installRegion = stageDir + "/region.json"
+	installLock   = stageDir + "/lock"
+	cnLaunchEntry = "AzurPromilia.exe"
+	jpLaunchEntry = "AzurPromiliaJP.exe"
 )
 
 type stagedUpdateFile struct {
@@ -56,7 +60,7 @@ func (p installPlan) commit(ctx context.Context, out io.Writer, root *os.Root) e
 	if err != nil || len(steps) == 0 {
 		return err
 	}
-	if err := writeInstallState(root, steps); err != nil {
+	if err := writeInstallJSON(root, installState, steps); err != nil {
 		return err
 	}
 	for i, step := range steps {
@@ -185,8 +189,8 @@ func applyInstallStep(root *os.Root, step installStep) error {
 	return root.Rename(step.From, step.To)
 }
 
-func writeInstallState(root *os.Root, steps []installStep) error {
-	temp := installState + ".tmp"
+func writeInstallJSON(root *os.Root, name string, value any) error {
+	temp := name + ".tmp"
 	if err := root.Remove(temp); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
@@ -195,14 +199,14 @@ func writeInstallState(root *os.Root, steps []installStep) error {
 		return err
 	}
 	defer root.Remove(temp)
-	writeErr := json.NewEncoder(file).Encode(steps)
+	writeErr := json.NewEncoder(file).Encode(value)
 	if writeErr == nil {
 		writeErr = file.Sync()
 	}
 	if err := errors.Join(writeErr, file.Close()); err != nil {
 		return err
 	}
-	return root.Rename(temp, installState)
+	return root.Rename(temp, name)
 }
 
 func recoverInstall(root *os.Root) error {
@@ -268,6 +272,59 @@ type installation struct {
 	Archive string `json:"archive,omitempty"`
 }
 
+func readInstallRegion(root *os.Root, folder string) (gameRegion, error) {
+	name := path.Join(folder, installRegion)
+	file, err := root.OpenFile(name, os.O_RDONLY|syscall.O_NONBLOCK, 0)
+	if errors.Is(err, os.ErrNotExist) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	defer file.Close()
+	data, err := readBounded(file, 32)
+	if err != nil {
+		return "", err
+	}
+	var region gameRegion
+	if json.Unmarshal(data, &region) != nil || !region.valid() {
+		return "", fmt.Errorf("invalid installation region in %s", name)
+	}
+	return region, nil
+}
+
+func checkInstallRegion(root *os.Root, region gameRegion) (needsRegion bool, err error) {
+	installed, err := readInstallRegion(root, ".")
+	if err != nil {
+		return false, err
+	}
+	if installed != "" && installed != region {
+		return false, fmt.Errorf("this directory is for region %s, use a separate --dir for %s", installed, region)
+	}
+	other, launchEntry := regionJP, jpLaunchEntry
+	if region == regionJP {
+		other, launchEntry = regionCN, cnLaunchEntry
+	}
+	if info, err := installEntry(root, launchEntry); err != nil {
+		return false, err
+	} else if info != nil {
+		return false, fmt.Errorf("found region %s file %q, use a separate --dir for %s", other, launchEntry, region)
+	}
+	if installed == "" && region == regionJP {
+		// Staging files from before region selection belong to CN.
+		entries, err := fs.ReadDir(root.FS(), stageDir)
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return false, err
+		}
+		for _, entry := range entries {
+			if entry.Name() != path.Base(installLock) && entry.Name() != path.Base(installRegion)+".tmp" {
+				return false, errors.New("this directory has existing CN download state, use a separate --dir for jp")
+			}
+		}
+	}
+	return installed == "", nil
+}
+
 func bundleHome(list manifest) string {
 	id := sha256.Sum256([]byte(fmt.Sprintf("%s\x00%d\x00%s", list.Build, list.Bundle.Size, list.Bundle.MD5)))
 	return fmt.Sprintf("%s/archives/%x", stageDir, id)
@@ -318,11 +375,11 @@ func readInstallRecord(root *os.Root, name string) (installation, error) {
 	return installed, nil
 }
 
-func scanInstalledVersions(ctx context.Context, root *os.Root, launchEntry string) (map[string]string, error) {
+func scanInstalledVersions(ctx context.Context, root *os.Root, launchEntry string, region gameRegion) (map[string]string, error) {
 	versions := make(map[string]string)
 	launchEntry = strings.ReplaceAll(launchEntry, "\\", "/")
 	if !validPath(launchEntry) {
-		launchEntry = "AzurPromilia.exe"
+		launchEntry = cnLaunchEntry
 	}
 	err := fs.WalkDir(root.FS(), ".", func(name string, entry fs.DirEntry, err error) error {
 		if err != nil {
@@ -339,12 +396,18 @@ func scanInstalledVersions(ctx context.Context, root *os.Root, launchEntry strin
 		case stageDir:
 			record, err := readInstallRecord(root, path.Join(folder, installRecord))
 			if err == nil {
-				versions[folder] = record.Build
+				installed, err := readInstallRegion(root, folder)
+				if err != nil {
+					return err
+				}
+				if installed == region || (installed == "" && region == regionCN) {
+					versions[folder] = record.Build
+				}
 			} else if !errors.Is(err, os.ErrNotExist) && !errors.Is(err, errInstallRecord) {
 				return err
 			}
 		case "_index":
-			if versions[folder] == "" {
+			if region == regionCN && versions[folder] == "" {
 				exe, err := installEntry(root, path.Join(folder, launchEntry))
 				if err != nil {
 					return err

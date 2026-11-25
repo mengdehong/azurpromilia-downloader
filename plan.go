@@ -316,17 +316,20 @@ func showPlan(out io.Writer, p plan) {
 	}
 }
 
-func inspectFiles(ctx context.Context, out io.Writer, list manifest, dir, command string, asJSON bool, options downloadOptions) error {
+func inspectFiles(ctx context.Context, out io.Writer, list manifest, dir, command string, region gameRegion, asJSON bool, options downloadOptions) error {
 	root, err := os.OpenRoot(dir)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
 	if root != nil {
 		defer root.Close()
+		if _, err := checkInstallRegion(root, region); err != nil {
+			return err
+		}
 		if info, err := installEntry(root, installState); err != nil {
 			return err
 		} else if info != nil {
-			return errors.New("an interrupted install is pending. Run download to recover it")
+			return fmt.Errorf("an interrupted install is pending. Run download with --region %s to recover it", region)
 		}
 	}
 	if command == "verify" {
@@ -370,7 +373,7 @@ func inspectFiles(ctx context.Context, out io.Writer, list manifest, dir, comman
 		fmt.Fprintln(out, "Game files verified.")
 		return nil
 	}
-	return fmt.Errorf("repair needed (%d missing, %d damaged). Run the downloader to repair the files", missing, len(p.Jobs)-missing)
+	return fmt.Errorf("repair needed (%d missing, %d damaged). Run the downloader with --region %s to repair the files", missing, len(p.Jobs)-missing, region)
 }
 
 func preflightDownload(ctx context.Context, out io.Writer, root *os.Root, p plan) error {
@@ -556,9 +559,8 @@ func (u *pathUpdate) verifyOld(ctx context.Context, root *os.Root, change pathTr
 		if !known || preserved(key, u.protected) {
 			return fmt.Errorf("the update is blocked by an untracked or protected path %q", name)
 		}
-		valid, err := obsoleteUnchanged(ctx, root, resource{
-			Path: name, Size: old.Size, SHA256: old.SHA256, MD5: old.MD5,
-		})
+		old.Path = name
+		valid, err := obsoleteUnchanged(ctx, root, old)
 		if err != nil {
 			return err
 		}

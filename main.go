@@ -48,13 +48,13 @@ func run(ctx context.Context, args []string, out io.Writer) error {
 	flags.SetOutput(out)
 	flags.Usage = func() {
 		if command == "check" {
-			fmt.Fprintf(out, "Usage: %s check [--dir DIRECTORY]\n", name)
+			fmt.Fprintf(out, "Usage: %s check [options]\n", name)
 			flags.PrintDefaults()
 			return
 		}
 		fmt.Fprintln(out, "Azur Promilia Downloader")
 		fmt.Fprintf(out, "  %-44s Download or update from the official servers\n", name+" [options]")
-		fmt.Fprintf(out, "  %-44s Show the official release and optionally find local installations\n", name+" check [--dir DIR]")
+		fmt.Fprintf(out, "  %-44s Show the latest release and optionally find local installations\n", name+" check [options]")
 		fmt.Fprintf(out, "  %-44s Show what would be downloaded\n", name+" plan [options]")
 		fmt.Fprintf(out, "  %-44s Check game files against the latest version\n", name+" verify [options]")
 		fmt.Fprintln(out)
@@ -65,6 +65,7 @@ func run(ctx context.Context, args []string, out io.Writer) error {
 		dir, dirHelp = "", "Scan this directory and its subdirectories for game installations"
 	}
 	flags.StringVar(&dir, "dir", dir, dirHelp)
+	regionFlag := flags.String("region", string(regionCN), "Game region (cn or jp)")
 	options := downloadOptions{
 		workers: defaultWorkers, verifyWorkers: defaultVerifyWorkers,
 		retries: 3, parts: defaultParts, partSize: defaultPartSize, summary: true,
@@ -92,6 +93,10 @@ func run(ctx context.Context, args []string, out io.Writer) error {
 	if flags.NArg() != 0 {
 		return fmt.Errorf("unexpected argument %q", flags.Arg(0))
 	}
+	region := gameRegion(*regionFlag)
+	if !region.valid() {
+		return fmt.Errorf("unsupported region %q (use cn or jp)", region)
+	}
 	if options.workers < 1 {
 		return errors.New("--workers must be at least 1")
 	}
@@ -101,7 +106,9 @@ func run(ctx context.Context, args []string, out io.Writer) error {
 	}
 	var target string
 	var err error
-	if command != "check" || flags.NFlag() > 0 {
+	dirSet := false
+	flags.Visit(func(f *flag.Flag) { dirSet = dirSet || f.Name == "dir" })
+	if command != "check" || dirSet {
 		if dir == "" {
 			return errors.New("the game resource directory cannot be empty")
 		}
@@ -120,43 +127,57 @@ func run(ctx context.Context, args []string, out io.Writer) error {
 	client := transferClient()
 	defer client.CloseIdleConnections()
 	if command == "check" {
-		return checkVersion(ctx, out, client, target)
+		return checkVersion(ctx, out, client, target, region)
+	}
+	loadManifest, versionSource := latestManifest, "official"
+	if region == regionJP {
+		loadManifest, versionSource = latestJPManifest, "JP"
 	}
 	if !asJSON {
-		fmt.Fprintf(out, "Checking the latest official version for %s\n", target)
+		fmt.Fprintf(out, "Checking the latest %s version for %s\n", versionSource, target)
 	}
-	list, err := latestManifest(ctx, client)
+	list, err := loadManifest(ctx, client)
 	if err != nil {
 		return err
 	}
 	if command != "download" {
-		return inspectFiles(ctx, out, list, target, command, asJSON, options)
+		return inspectFiles(ctx, out, list, target, command, region, asJSON, options)
 	}
 
 	fmt.Fprintf(out, "Latest version %s\n", list.Build)
-	if err := download(ctx, out, client, list, target, options); err != nil {
+	if err := download(ctx, out, client, list, target, region, options); err != nil {
 		return err
 	}
 	fmt.Fprintln(out, "Game files are ready.")
 	return nil
 }
 
-func checkVersion(ctx context.Context, out io.Writer, client *http.Client, dir string) error {
-	release, err := queryOfficial(ctx, client, officialVersion)
-	if err != nil {
-		return err
-	}
-	latest := release.buildID()
-	version := latest
-	if release.Name != latest && validBuildID(release.Name) {
-		version = fmt.Sprintf("%s (%s)", release.Name, latest)
-	}
-	fmt.Fprintf(out, "Official version  %s\n", version)
-	if release.PackageSize > 0 {
-		fmt.Fprintf(out, "Download size     %s\n", humanBytes(release.PackageSize))
-	}
-	if release.InstallSize > 0 {
-		fmt.Fprintf(out, "Install size      %s (official estimate)\n", humanBytes(release.InstallSize))
+func checkVersion(ctx context.Context, out io.Writer, client *http.Client, dir string, region gameRegion) error {
+	var latest, launchEntry string
+	if region == regionJP {
+		release, err := queryJP(ctx, client)
+		if err != nil {
+			return err
+		}
+		latest = release.Version
+		fmt.Fprintf(out, "JP version        %s (Nadare index)\n", latest)
+	} else {
+		release, err := queryOfficial(ctx, client, officialVersion)
+		if err != nil {
+			return err
+		}
+		latest, launchEntry = release.buildID(), release.LaunchEntry
+		version := latest
+		if release.Name != latest && validBuildID(release.Name) {
+			version = fmt.Sprintf("%s (%s)", release.Name, latest)
+		}
+		fmt.Fprintf(out, "Official version  %s\n", version)
+		if release.PackageSize > 0 {
+			fmt.Fprintf(out, "Download size     %s\n", humanBytes(release.PackageSize))
+		}
+		if release.InstallSize > 0 {
+			fmt.Fprintf(out, "Install size      %s (official estimate)\n", humanBytes(release.InstallSize))
+		}
 	}
 	if dir == "" {
 		return nil
@@ -167,7 +188,7 @@ func checkVersion(ctx context.Context, out io.Writer, client *http.Client, dir s
 		return err
 	}
 	defer root.Close()
-	versions, err := scanInstalledVersions(ctx, root, release.LaunchEntry)
+	versions, err := scanInstalledVersions(ctx, root, launchEntry, region)
 	if err != nil {
 		return err
 	}

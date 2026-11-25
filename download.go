@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"hash"
+	"hash/crc64"
 	"io"
 	"math"
 	"net/http"
@@ -73,7 +74,7 @@ func (w progressWriter) Write(p []byte) (int, error) {
 	return n, err
 }
 
-func download(ctx context.Context, out io.Writer, client *http.Client, list manifest, dir string, options downloadOptions) (err error) {
+func download(ctx context.Context, out io.Writer, client *http.Client, list manifest, dir string, region gameRegion, options downloadOptions) (err error) {
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return err
 	}
@@ -82,10 +83,13 @@ func download(ctx context.Context, out io.Writer, client *http.Client, list mani
 		return err
 	}
 	defer root.Close()
+	if _, err := checkInstallRegion(root, region); err != nil {
+		return err
+	}
 	if err := root.MkdirAll(stageDir, 0700); err != nil {
 		return err
 	}
-	lock, err := root.OpenFile(stageDir+"/lock", os.O_CREATE|os.O_RDWR, 0600)
+	lock, err := root.OpenFile(installLock, os.O_CREATE|os.O_RDWR, 0600)
 	if err != nil {
 		return err
 	}
@@ -95,6 +99,15 @@ func download(ctx context.Context, out io.Writer, client *http.Client, list mani
 			return errors.New("another download is using this folder")
 		}
 		return err
+	}
+	needsRegion, err := checkInstallRegion(root, region)
+	if err != nil {
+		return err
+	}
+	if needsRegion {
+		if err := writeInstallJSON(root, installRegion, region); err != nil {
+			return err
+		}
 	}
 	if err := recoverInstall(root); err != nil {
 		return err
@@ -941,11 +954,17 @@ func verifyDigest(ctx context.Context, root *os.Root, name string, resource reso
 	return digest == resource.digest(), err
 }
 
+var crc64XZ = crc64.MakeTable(crc64.ECMA)
+
 func (f resource) newHash() hash.Hash {
-	if f.SHA256 != "" {
+	switch {
+	case f.SHA256 != "":
 		return sha256.New()
+	case f.MD5 != "":
+		return md5.New()
+	default:
+		return crc64.New(crc64XZ)
 	}
-	return md5.New()
 }
 
 func (f resource) matchesHash(h hash.Hash) bool {
@@ -953,10 +972,7 @@ func (f resource) matchesHash(h hash.Hash) bool {
 }
 
 func (f resource) digest() string {
-	if f.SHA256 != "" {
-		return f.SHA256
-	}
-	return f.MD5
+	return cmp.Or(f.SHA256, f.MD5, f.CRC64)
 }
 
 func sha256File(ctx context.Context, root *os.Root, name string) (string, error) {

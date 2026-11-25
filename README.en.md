@@ -1,8 +1,8 @@
 # Azur Promilia Downloader
 
-[简体中文](README.md)
+[简体中文](README.md) · [日本語](README.ja.md)
 
-A third-party downloader for Linux that checks the official Azur Promilia release and downloads game resources directly from the game's CDN.
+A third-party downloader for Linux that downloads Azur Promilia game resources directly from the game's CDN.
 
 ## Usage
 
@@ -14,7 +14,9 @@ Run the same command for the first download and later updates. The downloader us
 
 ![Download progress in the terminal](download-progress.png)
 
-The downloader checks local files against the latest official index, skips files that pass verification, and downloads missing or changed files. It uses 10 download workers by default. Run the same command again after an interruption to resume. The game directory holds temporary files and the installation record under `.azur-download/`.
+The default region is China (`--region cn`). Use `--region jp` for Japan and give each region its own directory.
+
+The downloader checks local files against the release index, skips files that pass verification, and downloads missing or changed files. It uses 10 download workers by default. Run the same command again after an interruption to resume. The game directory holds temporary files and the installation record under `.azur-download/`.
 
 Use `--workers` to set the number of concurrent file downloads and `--limit` to cap the combined download speed. `--limit 20` means 20 MB/s. Use `--limit 0` for unlimited speed.
 

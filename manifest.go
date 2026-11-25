@@ -12,6 +12,17 @@ import (
 	"unicode"
 )
 
+type gameRegion string
+
+const (
+	regionCN gameRegion = "cn"
+	regionJP gameRegion = "jp"
+)
+
+func (r gameRegion) valid() bool {
+	return r == regionCN || r == regionJP
+}
+
 type manifest struct {
 	Build    string     `json:"build"`
 	Files    []resource `json:"files"`
@@ -25,6 +36,7 @@ type resource struct {
 	Size    int64    `json:"size"`
 	SHA256  string   `json:"sha256,omitempty"`
 	MD5     string   `json:"md5,omitempty"`
+	CRC64   string   `json:"crc64,omitempty"`
 	Mirrors []string `json:"mirrors,omitempty"`
 }
 
@@ -75,11 +87,12 @@ func (list *manifest) validateFiles(withURLs bool) error {
 			}
 		}
 		if (!validHex(f.SHA256, 32) && f.SHA256 != "") || (!validHex(f.MD5, 16) && f.MD5 != "") ||
-			(f.SHA256 == "" && f.MD5 == "") || f.Size < 0 || f.Size == math.MaxInt64 {
+			(!validHex(f.CRC64, 8) && f.CRC64 != "") || f.digest() == "" || f.Size < 0 || f.Size == math.MaxInt64 {
 			return fmt.Errorf("invalid file size or checksum for %s", f.Path)
 		}
 		f.SHA256 = strings.ToLower(f.SHA256)
 		f.MD5 = strings.ToLower(f.MD5)
+		f.CRC64 = strings.ToLower(f.CRC64)
 		if f.Size > math.MaxInt64-total {
 			return errors.New("total size exceeds the supported limit")
 		}
