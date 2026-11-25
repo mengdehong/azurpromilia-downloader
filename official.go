@@ -16,9 +16,12 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -36,6 +39,7 @@ const (
 const (
 	officialVersion  = "/pc-launcher/client/gameversion/config"
 	officialPackages = "/pc-launcher/client/gameversion/packageconfig"
+	maxIndexBytes    = 64 << 20
 )
 
 var officialOrigins = []string{"https://api-grp.manjuu.com", "https://api-grp-l2.manjuu.com"}
@@ -392,6 +396,17 @@ func indexResource(line int, name, length, md5, remote string, bases []string) (
 }
 
 func fetchPackageIndex(ctx context.Context, client *http.Client, pkg gamePackage) ([]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	cacheDir, _ := os.UserCacheDir()
+	var cache string
+	if cacheDir != "" {
+		cache = filepath.Join(cacheDir, "azurpromilia-downloader", "index")
+		if data := readCachedIndex(cache, pkg); data != nil {
+			return data, nil
+		}
+	}
 	var failure error
 	for _, address := range resolveCDNs(pkg.Path, pkg.CDNs) {
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, address, nil)
@@ -408,17 +423,53 @@ func fetchPackageIndex(ctx context.Context, client *http.Client, pkg gamePackage
 			failure = fmt.Errorf("index server returned HTTP %d", resp.StatusCode)
 			continue
 		}
-		data, err := readBounded(resp.Body, 64<<20)
+		data, err := readBounded(resp.Body, maxIndexBytes)
 		resp.Body.Close()
 		if err == nil {
 			err = checkIndex(data, pkg)
 		}
 		if err == nil {
+			if cache != "" {
+				cacheIndex(cache, data)
+			}
 			return data, nil
 		}
 		failure = err
 	}
 	return nil, fmt.Errorf("could not download the official index: %w", failure)
+}
+
+func readCachedIndex(name string, pkg gamePackage) []byte {
+	file, err := os.OpenFile(name, os.O_RDONLY|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		return nil
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil || !info.Mode().IsRegular() || info.Size() != pkg.Size || pkg.Size > maxIndexBytes {
+		return nil
+	}
+	data, err := readBounded(file, maxIndexBytes)
+	if err != nil || checkIndex(data, pkg) != nil {
+		return nil
+	}
+	return data
+}
+
+func cacheIndex(name string, data []byte) {
+	dir := filepath.Dir(name)
+	if os.MkdirAll(dir, 0700) != nil {
+		return
+	}
+	file, err := os.CreateTemp(dir, "index-*")
+	if err != nil {
+		return
+	}
+	defer os.Remove(file.Name())
+	_, err = file.Write(data)
+	if errors.Join(err, file.Close()) == nil {
+		_ = os.Rename(file.Name(), name)
+	}
 }
 
 func checkIndex(data []byte, pkg gamePackage) error {

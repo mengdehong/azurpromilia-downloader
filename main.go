@@ -190,7 +190,7 @@ func checkVersion(ctx context.Context, out io.Writer, client *http.Client, dir s
 func transferClient() *http.Client {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.ResponseHeaderTimeout = 30 * time.Second
-	transport.MaxIdleConnsPerHost = max(maxDownloadWorkers, defaultWorkers*defaultParts)
+	transport.MaxIdleConnsPerHost = maxConcurrentTransfers
 	return &http.Client{Transport: transport}
 }
 

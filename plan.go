@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"maps"
 	"math"
 	"os"
 	"path"
@@ -106,10 +107,92 @@ type fileCheck struct {
 	reused        bool
 }
 
+const stageChecksPath = stageDir + "/staged-checks.json"
+
+type stageStamp struct {
+	Device, Inode     uint64
+	Size              int64
+	Modified, Changed syscall.Timespec
+}
+
+func stampStagedFile(info os.FileInfo) stageStamp {
+	// Hashing can change atime. Ctime also detects writes that restore the mtime.
+	stat := info.Sys().(*syscall.Stat_t)
+	return stageStamp{uint64(stat.Dev), uint64(stat.Ino), info.Size(), stat.Mtim, stat.Ctim}
+}
+
+type stageChecks struct {
+	boot     string
+	previous map[string]stageStamp
+	mu       sync.Mutex
+	current  map[string]stageStamp
+}
+
+type stageCheckRecord struct {
+	Boot  string
+	Files map[string]stageStamp
+}
+
+func loadStageChecks(root *os.Root) *stageChecks {
+	// After a reboot a completed write may have been lost without its metadata changing.
+	boot, err := os.ReadFile("/proc/sys/kernel/random/boot_id")
+	bootID := strings.TrimSpace(string(boot))
+	if err != nil || bootID == "" {
+		return nil
+	}
+	checks := &stageChecks{boot: bootID, current: make(map[string]stageStamp)}
+	file, err := root.OpenFile(stageChecksPath, os.O_RDONLY|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		return checks
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil || !info.Mode().IsRegular() {
+		return checks
+	}
+	data, err := readBounded(file, 64<<20)
+	var record stageCheckRecord
+	if err == nil && json.Unmarshal(data, &record) == nil && record.Boot == checks.boot {
+		checks.previous = record.Files
+	}
+	return checks
+}
+
+func (c *stageChecks) contains(name string, stamp stageStamp) bool {
+	if c == nil {
+		return false
+	}
+	previous, ok := c.previous[name]
+	return ok && previous == stamp
+}
+
+func (c *stageChecks) record(name string, stamp stageStamp) {
+	c.mu.Lock()
+	c.current[name] = stamp
+	c.mu.Unlock()
+}
+
+func (c *stageChecks) save(root *os.Root) {
+	if c == nil || len(c.current) == 0 || maps.Equal(c.previous, c.current) {
+		return
+	}
+	temp := stageChecksPath + ".tmp"
+	_ = root.Remove(temp)
+	file, err := root.OpenFile(temp, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+	if err != nil {
+		return
+	}
+	defer root.Remove(temp)
+	err = json.NewEncoder(file).Encode(stageCheckRecord{Boot: c.boot, Files: c.current})
+	if errors.Join(err, file.Close()) == nil {
+		_ = root.Rename(temp, stageChecksPath)
+	}
+}
+
 func checkPlanFile(ctx context.Context, root *os.Root, f resource, update *pathUpdate, opts downloadOptions) (fileCheck, error) {
 	result := fileCheck{status: "missing"}
 	if root == nil {
-		result.cache.assemble = len(splitFile(f, opts)) > 1
+		result.cache.assemble = canSplitFile(f, opts)
 		return result, nil
 	}
 	if update.at(f.Path) != "" {

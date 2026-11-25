@@ -1,6 +1,7 @@
 package main
 
 import (
+	"cmp"
 	"context"
 	"crypto/md5"
 	"crypto/sha256"
@@ -12,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"path"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -23,16 +25,18 @@ import (
 const stageDir = ".azur-download"
 
 const (
-	defaultWorkers       = 4
-	maxDownloadWorkers   = 10
-	defaultVerifyWorkers = 8
-	maxVerifyWorkers     = 64
-	defaultParts         = 4
-	defaultPartSize      = int64(32 << 20)
+	maxDownloadWorkers     = 10
+	defaultWorkers         = maxDownloadWorkers
+	maxConcurrentTransfers = 16
+	defaultVerifyWorkers   = 8
+	maxVerifyWorkers       = 64
+	defaultParts           = 4
+	defaultPartSize        = int64(32 << 20)
 )
 
 type downloadOptions struct {
 	previous                *manifest
+	stageChecks             *stageChecks
 	workers, retries, parts int
 	verifyWorkers           int
 	partSize, limit         int64
@@ -69,7 +73,7 @@ func (w progressWriter) Write(p []byte) (int, error) {
 	return n, err
 }
 
-func download(ctx context.Context, out io.Writer, client *http.Client, list manifest, dir string, options downloadOptions) error {
+func download(ctx context.Context, out io.Writer, client *http.Client, list manifest, dir string, options downloadOptions) (err error) {
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return err
 	}
@@ -101,6 +105,12 @@ func download(ctx context.Context, out io.Writer, client *http.Client, list mani
 	if list.Bundle != nil {
 		return downloadArchive(ctx, out, client, root, list, options)
 	}
+	options.stageChecks = loadStageChecks(root)
+	defer func() {
+		if err != nil {
+			options.stageChecks.save(root)
+		}
+	}()
 	p, err := planDownload(ctx, root, list, options, out)
 	if err != nil {
 		return err
@@ -125,35 +135,57 @@ func download(ctx context.Context, out io.Writer, client *http.Client, list mani
 		staged = append(staged, stagedUpdateFile{job.Path, partPath(job.File)})
 	}
 	staged = append(staged, receipt)
-	return (installPlan{layout: p.update, files: staged}).commit(ctx, out, root)
+	if err := (installPlan{layout: p.update, files: staged}).commit(ctx, out, root); err != nil {
+		return err
+	}
+	_ = root.Remove(stageChecksPath)
+	return nil
 }
 
 func downloadPlanned(ctx context.Context, out io.Writer, client *http.Client, root *os.Root, p plan, options downloadOptions, stageOnly bool) error {
+	workers := min(options.workers, len(p.Jobs))
+	transferSlots := max(workers, maxConcurrentTransfers)
 	d := downloader{
 		client: client, root: root, options: options,
 		limit:   &rateLimit{bytesPerSecond: options.limit},
 		retries: &retryWindows{until: make(map[string]time.Time)},
 		// Share request slots between whole files and their range requests.
-		transfers: make(chan struct{}, max(options.workers, defaultWorkers*defaultParts)),
+		transfers: make(chan struct{}, transferSlots),
 	}
-	workers := min(options.workers, len(p.Jobs))
+	var large, regular fileQueue
+	for i := range p.Jobs {
+		job := &p.Jobs[i]
+		if job.Bytes > 0 && canSplitFile(job.File, options) {
+			large.jobs = append(large.jobs, job)
+		} else {
+			regular.jobs = append(regular.jobs, job)
+		}
+	}
+	slices.SortStableFunc(large.jobs, func(a, b *planFile) int { return cmp.Compare(b.Bytes, a.Bytes) })
+	// Each split file needs up to parts-1 extra request slots. Reserve capacity for whole files.
+	largeWorkers := min(len(large.jobs), max(1, workers-1), max(1, (transferSlots-workers)/max(1, options.parts-1)))
 	progress := newDownloadProgress(p, workers)
 	panel := newDownloadPanel(out)
 	interval := time.Second
 	if panel != nil {
 		interval = 500 * time.Millisecond
 	}
-	var next atomic.Int64
 	var group sync.WaitGroup
 	for i := range progress.slots {
 		slot := &progress.slots[i]
+		first, second := &regular, &large
+		if i < largeWorkers {
+			first, second = second, first
+		}
 		group.Go(func() {
 			for ctx.Err() == nil {
-				i := next.Add(1) - 1
-				if i >= int64(len(p.Jobs)) {
+				job := first.take()
+				if job == nil {
+					job = second.take()
+				}
+				if job == nil {
 					return
 				}
-				job := &p.Jobs[i]
 				progress.start(slot, job)
 				err := d.file(ctx, *job, stageOnly, &slot.fileProgress)
 				progress.finish(slot, err, ctx.Err())
@@ -202,6 +234,19 @@ func downloadPlanned(ctx context.Context, out io.Writer, client *http.Client, ro
 			return nil
 		}
 	}
+}
+
+type fileQueue struct {
+	jobs []*planFile
+	next atomic.Int64
+}
+
+func (q *fileQueue) take() *planFile {
+	index := q.next.Add(1) - 1
+	if index >= int64(len(q.jobs)) {
+		return nil
+	}
+	return q.jobs[index]
 }
 
 func (d downloader) file(ctx context.Context, job planFile, stageOnly bool, progress *fileProgress) error {
@@ -339,11 +384,11 @@ func (d downloader) discard(f resource, name string) error {
 	if err := d.root.Remove(name); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
-	return d.removeParts(splitFile(f, d.options))
+	return d.removeFileParts(f)
 }
 
 func (d downloader) commit(f resource, staged string, stageOnly bool) error {
-	if err := d.removeParts(splitFile(f, d.options)); err != nil {
+	if err := d.removeFileParts(f); err != nil {
 		return err
 	}
 	if stageOnly {
@@ -352,19 +397,63 @@ func (d downloader) commit(f resource, staged string, stageOnly bool) error {
 	return d.root.Rename(staged, f.Path)
 }
 
-func splitFile(f resource, options downloadOptions) []filePart {
-	if options.parts <= 1 || f.Size <= options.partSize {
-		return nil
+func canSplitFile(f resource, options downloadOptions) bool {
+	return options.parts > 1 && f.Size > max(1, options.partSize)
+}
+
+func partLayouts(f resource, options downloadOptions) (current, legacy []filePart) {
+	if !canSplitFile(f, options) {
+		return nil, nil
 	}
-	size := max(options.partSize, (f.Size-1)/int64(options.parts)+1)
+	// Shorter ranges let a freed connection pick up more data while its peers are still working.
+	size := max(1, options.partSize/2, (f.Size-1)/int64(options.parts)/2+1)
+	oldSize := max(options.partSize, (f.Size-1)/int64(options.parts)+1)
 	stem := partPath(f)
+	current = splitFile(stem, f.Size, size)
+	if oldSize != size {
+		legacy = splitFile(stem, f.Size, oldSize)
+	}
+	return current, legacy
+}
+
+func splitFile(stem string, total, size int64) []filePart {
 	var pieces []filePart
-	for start := int64(0); start < f.Size; {
-		end := start + min(size, f.Size-start)
+	for start := int64(0); start < total; {
+		end := start + min(size, total-start)
 		pieces = append(pieces, filePart{fmt.Sprintf("%s.%d.%d", stem, size, start), start, end})
 		start = end
 	}
 	return pieces
+}
+
+func resumableParts(root *os.Root, f resource, options downloadOptions) ([]filePart, int64, error) {
+	current, legacy := partLayouts(f, options)
+	saved, err := retainedParts(root, current)
+	if err != nil {
+		return nil, 0, err
+	}
+	previous, err := retainedParts(root, legacy)
+	if err != nil {
+		return nil, 0, err
+	}
+	if previous > saved {
+		return legacy, previous, nil
+	}
+	return current, saved, nil
+}
+
+func retainedParts(root *os.Root, pieces []filePart) (int64, error) {
+	var saved int64
+	for _, piece := range pieces {
+		n, err := regularSize(root, piece.path)
+		if err != nil {
+			return 0, err
+		}
+		if n > 0 && n <= piece.end-piece.start {
+			saved += n
+		}
+	}
+	return saved, nil
 }
 
 type stagedCache struct {
@@ -380,41 +469,36 @@ func checkCache(ctx context.Context, root *os.Root, f resource, options download
 		return stagedCache{}, err
 	}
 	if info != nil && info.Size() == f.Size {
-		valid, err := verifyDigest(ctx, root, part, f)
-		if valid {
-			return stagedCache{checked: info, bytes: f.Size, valid: true}, err
+		checks := options.stageChecks
+		stamp := stampStagedFile(info)
+		if !checks.contains(part, stamp) {
+			valid, err := verifyDigest(ctx, root, part, f)
+			if !valid || err != nil {
+				return stagedCache{checked: info, assemble: canSplitFile(f, options)}, err
+			}
 		}
-		return stagedCache{checked: info, assemble: len(splitFile(f, options)) > 1}, err
+		if checks != nil {
+			checks.record(part, stamp)
+		}
+		return stagedCache{checked: info, bytes: f.Size, valid: true}, nil
 	}
 	if info != nil && info.Size() > 0 && info.Size() < f.Size {
 		return stagedCache{bytes: info.Size()}, nil
 	}
-	var saved int64
-	pieces := splitFile(f, options)
-	for _, piece := range pieces {
-		n, err := regularSize(root, piece.path)
-		if err != nil {
-			return stagedCache{}, err
-		}
-		if n > 0 && n <= piece.end-piece.start {
-			saved += n
-		}
-	}
-	return stagedCache{bytes: saved, assemble: len(pieces) > 1}, nil
+	pieces, saved, err := resumableParts(root, f, options)
+	return stagedCache{bytes: saved, assemble: len(pieces) > 1}, err
 }
 
 func sameStagedFile(before, after os.FileInfo) bool {
-	if after == nil || !os.SameFile(before, after) || before.Size() != after.Size() {
-		return false
-	}
-	// Reading the checksum can change atime. Compare the modification and change times.
-	old, current := before.Sys().(*syscall.Stat_t), after.Sys().(*syscall.Stat_t)
-	return old.Mtim == current.Mtim && old.Ctim == current.Ctim
+	return after != nil && stampStagedFile(before) == stampStagedFile(after)
 }
 
 func (d downloader) fetchFile(ctx context.Context, f resource, part string, offset int64, progress *fileProgress) (bool, error) {
-	pieces := splitFile(f, d.options)
-	if offset <= 0 && len(pieces) > 1 {
+	if offset <= 0 && canSplitFile(f, d.options) {
+		pieces, _, err := resumableParts(d.root, f, d.options)
+		if err != nil {
+			return false, err
+		}
 		retry, err := d.fetchParts(ctx, f, part, pieces, progress)
 		if !errors.Is(err, errNoRanges) {
 			return retry, err
@@ -441,8 +525,16 @@ func (d downloader) fetchParts(ctx context.Context, f resource, part string, pie
 		err   error
 	}
 	results := make(chan outcome, len(pieces))
+	concurrent := make(chan struct{}, min(d.options.parts, len(pieces)))
 	for _, piece := range pieces {
 		go func() {
+			select {
+			case concurrent <- struct{}{}:
+				defer func() { <-concurrent }()
+			case <-work.Done():
+				results <- outcome{false, work.Err()}
+				return
+			}
 			offset, err := regularSize(d.root, piece.path)
 			if err != nil || offset == piece.end-piece.start {
 				results <- outcome{false, err}
@@ -504,6 +596,14 @@ func (d downloader) fetchParts(ctx context.Context, f resource, part string, pie
 		return true, errChecksum
 	}
 	return false, d.root.Rename(assembly, part)
+}
+
+func (d downloader) removeFileParts(f resource) error {
+	current, legacy := partLayouts(f, d.options)
+	if err := d.removeParts(current); err != nil {
+		return err
+	}
+	return d.removeParts(legacy)
 }
 
 func (d downloader) removeParts(pieces []filePart) error {

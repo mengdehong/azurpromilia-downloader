@@ -12,9 +12,9 @@ Run the same command for the first download and later updates. The downloader us
 ./azurpromilia-downloader --dir /path/to/your/AzurPromilia
 ```
 
-![Download progress in the terminal](assets/download-progress.png)
+![Download progress in the terminal](download-progress.png)
 
-The downloader checks local files against the latest official index, skips files that pass verification, and downloads missing or changed files. It uses four download workers by default. Run the same command again after an interruption to resume. The game directory holds temporary files and the installation record under `.azur-download/`.
+The downloader checks local files against the latest official index, skips files that pass verification, and downloads missing or changed files. It uses 10 download workers by default. Run the same command again after an interruption to resume. The game directory holds temporary files and the installation record under `.azur-download/`.
 
 Use `--workers` to set the number of concurrent file downloads and `--limit` to cap the combined download speed. `--limit 20` means 20 MB/s. Use `--limit 0` for unlimited speed.
 
