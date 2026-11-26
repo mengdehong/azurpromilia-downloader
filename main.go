@@ -65,7 +65,7 @@ func run(ctx context.Context, args []string, out io.Writer) error {
 		dir, dirHelp = "", "Scan this directory and its subdirectories for game installations"
 	}
 	flags.StringVar(&dir, "dir", dir, dirHelp)
-	regionFlag := flags.String("region", string(regionCN), "Game region (cn or jp)")
+	regionFlag := flags.String("region", string(regionCN), "Game region (cn, jp, kr, tw)")
 	options := downloadOptions{
 		workers: defaultWorkers, verifyWorkers: defaultVerifyWorkers,
 		retries: 3, parts: defaultParts, partSize: defaultPartSize, summary: true,
@@ -95,7 +95,7 @@ func run(ctx context.Context, args []string, out io.Writer) error {
 	}
 	region := gameRegion(*regionFlag)
 	if !region.valid() {
-		return fmt.Errorf("unsupported region %q (use cn or jp)", region)
+		return fmt.Errorf("unsupported region %q (use cn, jp, kr, or tw)", region)
 	}
 	if options.workers < 1 {
 		return errors.New("--workers must be at least 1")
@@ -129,9 +129,14 @@ func run(ctx context.Context, args []string, out io.Writer) error {
 	if command == "check" {
 		return checkVersion(ctx, out, client, target, region)
 	}
-	loadManifest, versionSource := latestManifest, "official"
-	if region == regionJP {
+	loadManifest, versionSource := region.launcher().latestManifest, "official"
+	switch region {
+	case regionJP:
 		loadManifest, versionSource = latestJPManifest, "JP"
+	case regionKR:
+		loadManifest, versionSource = latestKRManifest, "KR"
+	case regionTW:
+		versionSource = "TW"
 	}
 	if !asJSON {
 		fmt.Fprintf(out, "Checking the latest %s version for %s\n", versionSource, target)
@@ -154,15 +159,30 @@ func run(ctx context.Context, args []string, out io.Writer) error {
 
 func checkVersion(ctx context.Context, out io.Writer, client *http.Client, dir string, region gameRegion) error {
 	var latest, launchEntry string
-	if region == regionJP {
+	switch region {
+	case regionJP:
 		release, err := queryJP(ctx, client)
 		if err != nil {
 			return err
 		}
 		latest = release.Version
 		fmt.Fprintf(out, "JP version        %s (Nadare index)\n", latest)
-	} else {
-		release, err := queryOfficial(ctx, client, officialVersion)
+	case regionKR:
+		list, err := latestKRManifest(ctx, client)
+		if err != nil {
+			return err
+		}
+		latest = list.Build
+		var downloadSize, installedSize int64
+		for _, f := range list.Files {
+			downloadSize += f.networkRemaining(0)
+			installedSize += f.Size
+		}
+		fmt.Fprintf(out, "KR build          %s (Nexon manifest)\n", latest)
+		fmt.Fprintf(out, "Download size     %s\n", humanBytes(downloadSize))
+		fmt.Fprintf(out, "Install size      %s\n", humanBytes(installedSize))
+	default:
+		release, err := region.launcher().query(ctx, client, officialVersion)
 		if err != nil {
 			return err
 		}
@@ -171,7 +191,11 @@ func checkVersion(ctx context.Context, out io.Writer, client *http.Client, dir s
 		if release.Name != latest && validBuildID(release.Name) {
 			version = fmt.Sprintf("%s (%s)", release.Name, latest)
 		}
-		fmt.Fprintf(out, "Official version  %s\n", version)
+		label := "Official version"
+		if region == regionTW {
+			label = "TW version"
+		}
+		fmt.Fprintf(out, "%-18s%s\n", label, version)
 		if release.PackageSize > 0 {
 			fmt.Fprintf(out, "Download size     %s\n", humanBytes(release.PackageSize))
 		}

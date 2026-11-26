@@ -15,7 +15,7 @@ go build .
 ./azurpromilia-downloader --region jp --dir /path/to/AzurPromiliaJP
 ```
 
-`--region` を省略すると中国版が選択されます。保存先はリージョンごとに分けてください。`--dir` を省略した場合は、カレントディレクトリに保存されます。
+`--region` を省略すると中国版（`cn`）が選択されます。日本版は `jp`、韓国版は `kr`、台湾・香港・マカオ版は `tw` です。保存先はリージョンごとに分けてください。`--dir` を省略した場合は、カレントディレクトリに保存されます。
 
 ![ダウンロードの進捗表示](download-progress.png)
 

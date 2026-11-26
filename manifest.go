@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/sha1"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -17,10 +18,12 @@ type gameRegion string
 const (
 	regionCN gameRegion = "cn"
 	regionJP gameRegion = "jp"
+	regionTW gameRegion = "tw"
+	regionKR gameRegion = "kr"
 )
 
 func (r gameRegion) valid() bool {
-	return r == regionCN || r == regionJP
+	return r == regionCN || r == regionJP || r == regionTW || r == regionKR
 }
 
 type manifest struct {
@@ -31,13 +34,30 @@ type manifest struct {
 }
 
 type resource struct {
-	Path    string   `json:"path"`
-	URL     string   `json:"url,omitempty"`
-	Size    int64    `json:"size"`
-	SHA256  string   `json:"sha256,omitempty"`
-	MD5     string   `json:"md5,omitempty"`
-	CRC64   string   `json:"crc64,omitempty"`
-	Mirrors []string `json:"mirrors,omitempty"`
+	Path      string   `json:"path"`
+	URL       string   `json:"url,omitempty"`
+	Size      int64    `json:"size"`
+	SHA256    string   `json:"sha256,omitempty"`
+	MD5       string   `json:"md5,omitempty"`
+	CRC64     string   `json:"crc64,omitempty"`
+	NexonSHA1 string   `json:"nexon_sha1,omitempty"`
+	ChunkSize int64    `json:"chunk_size,omitempty"`
+	Mirrors   []string `json:"mirrors,omitempty"`
+	chunks    []nexonChunk
+}
+
+func (f resource) networkRemaining(saved int64) int64 {
+	if saved >= f.Size {
+		return 0
+	}
+	if f.NexonSHA1 == "" {
+		return f.Size - saved
+	}
+	var remaining int64
+	for _, chunk := range f.chunks[saved/f.ChunkSize:] {
+		remaining += chunk.size
+	}
+	return remaining
 }
 
 type zipBundle struct {
@@ -79,7 +99,7 @@ func (list *manifest) validateFiles(withURLs bool) error {
 			return fmt.Errorf("duplicate path in the download list: %q", f.Path)
 		}
 		paths[key] = struct{}{}
-		if withURLs {
+		if withURLs && f.NexonSHA1 == "" {
 			for _, address := range append([]string{f.URL}, f.Mirrors...) {
 				if !validHTTP(address) {
 					return fmt.Errorf("invalid download URL for %s", f.Path)
@@ -90,9 +110,14 @@ func (list *manifest) validateFiles(withURLs bool) error {
 			(!validHex(f.CRC64, 8) && f.CRC64 != "") || f.digest() == "" || f.Size < 0 || f.Size == math.MaxInt64 {
 			return fmt.Errorf("invalid file size or checksum for %s", f.Path)
 		}
+		if f.NexonSHA1 != "" && (!validHex(f.NexonSHA1, sha1.Size) || f.ChunkSize < 1 || f.ChunkSize > maxNexonChunkSize ||
+			(withURLs && int64(len(f.chunks)) != nexonChunkCount(f.Size, f.ChunkSize))) {
+			return fmt.Errorf("invalid Nexon checksum or chunks for %s", f.Path)
+		}
 		f.SHA256 = strings.ToLower(f.SHA256)
 		f.MD5 = strings.ToLower(f.MD5)
 		f.CRC64 = strings.ToLower(f.CRC64)
+		f.NexonSHA1 = strings.ToLower(f.NexonSHA1)
 		if f.Size > math.MaxInt64-total {
 			return errors.New("total size exceeds the supported limit")
 		}

@@ -29,6 +29,8 @@ const (
 	installLock   = stageDir + "/lock"
 	cnLaunchEntry = "AzurPromilia.exe"
 	jpLaunchEntry = "AzurPromiliaJP.exe"
+	twSDKBrowser  = "AzurPromilia_Data/Plugins/mj_sdk/sdkbrowser.exe"
+	krCrashClient = "CrashReportClient.exe"
 )
 
 type stagedUpdateFile struct {
@@ -301,16 +303,7 @@ func checkInstallRegion(root *os.Root, region gameRegion) (needsRegion bool, err
 	if installed != "" && installed != region {
 		return false, fmt.Errorf("this directory is for region %s, use a separate --dir for %s", installed, region)
 	}
-	other, launchEntry := regionJP, jpLaunchEntry
-	if region == regionJP {
-		other, launchEntry = regionCN, cnLaunchEntry
-	}
-	if info, err := installEntry(root, launchEntry); err != nil {
-		return false, err
-	} else if info != nil {
-		return false, fmt.Errorf("found region %s file %q, use a separate --dir for %s", other, launchEntry, region)
-	}
-	if installed == "" && region == regionJP {
+	if installed == "" && region != regionCN {
 		// Staging files from before region selection belong to CN.
 		entries, err := fs.ReadDir(root.FS(), stageDir)
 		if err != nil && !errors.Is(err, os.ErrNotExist) {
@@ -318,11 +311,58 @@ func checkInstallRegion(root *os.Root, region gameRegion) (needsRegion bool, err
 		}
 		for _, entry := range entries {
 			if entry.Name() != path.Base(installLock) && entry.Name() != path.Base(installRegion)+".tmp" {
-				return false, errors.New("this directory has existing CN download state, use a separate --dir for jp")
+				return false, fmt.Errorf("this directory has existing CN download state, use a separate --dir for %s", region)
 			}
 		}
 	}
+	sharedRegion := installed
+	if sharedRegion != regionCN && sharedRegion != regionTW && sharedRegion != regionKR {
+		sharedRegion, err = sharedLaunchRegion(root, ".")
+		if err != nil {
+			return false, err
+		}
+	}
+	for _, candidate := range []struct {
+		region gameRegion
+		marker string
+	}{
+		{regionJP, jpLaunchEntry},
+		{regionTW, twSDKBrowser},
+		{regionKR, krCrashClient},
+		{sharedRegion, cnLaunchEntry},
+	} {
+		if candidate.region == region {
+			continue
+		}
+		info, err := installEntry(root, candidate.marker)
+		if err != nil {
+			return false, err
+		}
+		if info != nil {
+			return false, fmt.Errorf("found region %s file %q, use a separate --dir for %s", candidate.region, candidate.marker, region)
+		}
+	}
 	return installed == "", nil
+}
+
+func sharedLaunchRegion(root *os.Root, folder string) (gameRegion, error) {
+	// CN, TW and KR share an executable name.
+	for _, candidate := range []struct {
+		region gameRegion
+		marker string
+	}{
+		{regionTW, twSDKBrowser},
+		{regionKR, krCrashClient},
+	} {
+		info, err := installEntry(root, path.Join(folder, candidate.marker))
+		if err != nil {
+			return "", err
+		}
+		if info != nil {
+			return candidate.region, nil
+		}
+	}
+	return regionCN, nil
 }
 
 func bundleHome(list manifest) string {
@@ -407,12 +447,19 @@ func scanInstalledVersions(ctx context.Context, root *os.Root, launchEntry strin
 				return err
 			}
 		case "_index":
-			if region == regionCN && versions[folder] == "" {
+			if (region == regionCN || region == regionTW) && versions[folder] == "" {
 				exe, err := installEntry(root, path.Join(folder, launchEntry))
 				if err != nil {
 					return err
 				}
 				if exe != nil && exe.Mode().IsRegular() {
+					localRegion, err := sharedLaunchRegion(root, folder)
+					if err != nil {
+						return err
+					}
+					if localRegion != region {
+						return fs.SkipDir
+					}
 					build, err := readLauncherVersion(root, path.Join(name, "version"))
 					if err != nil {
 						return err

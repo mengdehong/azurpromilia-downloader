@@ -40,11 +40,13 @@ func (s *downloadStats) add(job *planFile, saved, received int64, localFallback 
 	s.saved += delta
 	s.received += received
 	if job.Local == "" {
-		s.downloaded += delta
-		s.remaining -= delta
+		transferred := job.File.networkRemaining(job.Cached) - job.File.networkRemaining(saved)
+		s.downloaded += transferred
+		s.remaining -= transferred
 	} else if localFallback {
-		s.downloaded += saved
-		s.remaining += job.File.Size - saved
+		remaining := job.File.networkRemaining(saved)
+		s.downloaded += job.File.networkRemaining(0) - remaining
+		s.remaining += remaining
 	}
 }
 
@@ -62,8 +64,9 @@ func newDownloadProgress(p plan, workers int) *downloadProgress {
 	for _, job := range p.Jobs {
 		progress.totals.saved += job.Cached
 		if job.Local == "" {
-			progress.totals.downloaded += job.Cached
-			progress.totals.remaining += job.File.Size - job.Cached
+			remaining := job.File.networkRemaining(job.Cached)
+			progress.totals.downloaded += job.File.networkRemaining(0) - remaining
+			progress.totals.remaining += remaining
 		}
 	}
 	return progress

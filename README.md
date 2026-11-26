@@ -17,7 +17,21 @@ go build .
 
 ![终端下载进度](download-progress.png)
 
-默认下载国服（`--region cn`）。用 `--region jp` 选择日服，并为两个区服使用各自的目录。
+默认下载国服。请为每个区服指定独立的目录。
+
+| 区服 | 参数 | 官网 |
+| --- | --- | --- |
+| 国服 | `--region cn` | [蛮啾](https://azurpromilia.manjuu.com/) |
+| 日服 | `--region jp` | [Yostar](https://azurpromilia.jp/) |
+| 韩服 | `--region kr` | [Nexon](https://azurpromilia.nexon.com/) |
+| 台服（台港澳） | `--region tw` | [JIMI](https://azurpromilia.jimi-global.com/) |
+
+```bash
+./azurpromilia-downloader --region kr --dir /path/to/AzurPromiliaKR
+./azurpromilia-downloader --region tw --dir /path/to/AzurPromiliaTW
+```
+
+韩服和台服均可直接从官方 CDN 下载 PC 游戏资源。韩服的 `check` 显示 Nexon 清单 ID，`plan` 按压缩后的传输量和解压后的空间需求分别估算。Windows 用户也可以使用官方入口。[韩服官方下载页](https://azurpromilia.nexon.com/support/download) · [台服官方下载页](https://azurpromilia.jimi-global.com/home/)
 
 下载器会根据资源索引检查本地文件，跳过已有文件，并下载缺失或发生变更的文件。
 
@@ -31,7 +45,7 @@ go build .
 
 `./azurpromilia-downloader check` 查看官方版本和下载大小。加上 `--dir /path/to/your/AzurPromilia` 可递归查找该目录下的游戏安装并比较版本。
 
-`./azurpromilia-downloader plan --dir /path/to/your/AzurPromilia` 查看该目录的预计下载量和所需磁盘空间。
+`./azurpromilia-downloader plan --dir /path/to/your/AzurPromilia` 查看该目录的预计下载量和所需磁盘空间。`verify` 检查本地资源完整性。这些命令也接受 `--region`。
 
 运行 `./azurpromilia-downloader --help` 可查看可用选项。
 

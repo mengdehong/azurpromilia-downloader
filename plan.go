@@ -78,7 +78,7 @@ func planDownload(ctx context.Context, root *os.Root, list manifest, options dow
 		p.ResumeBytes += result.cache.bytes
 		remaining := f.Size - result.cache.bytes
 		p.RequiredBytes += remaining
-		downloadBytes := remaining
+		downloadBytes := f.networkRemaining(result.cache.bytes)
 		if result.local != "" {
 			downloadBytes = 0
 		}

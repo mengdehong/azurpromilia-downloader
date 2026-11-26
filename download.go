@@ -4,6 +4,7 @@ import (
 	"cmp"
 	"context"
 	"crypto/md5"
+	"crypto/sha1"
 	"crypto/sha256"
 	"errors"
 	"fmt"
@@ -503,7 +504,7 @@ func (d downloader) commit(f resource, staged string, stageOnly bool) error {
 }
 
 func canSplitFile(f resource, options downloadOptions) bool {
-	return options.parts > 1 && f.Size > max(1, options.partSize)
+	return f.NexonSHA1 == "" && options.parts > 1 && f.Size > max(1, options.partSize)
 }
 
 func partLayouts(f resource, options downloadOptions) (current, legacy []filePart) {
@@ -588,7 +589,11 @@ func checkCache(ctx context.Context, root *os.Root, f resource, options download
 		return stagedCache{checked: info, bytes: f.Size, valid: true}, nil
 	}
 	if info != nil && info.Size() > 0 && info.Size() < f.Size {
-		return stagedCache{bytes: info.Size()}, nil
+		saved := info.Size()
+		if f.NexonSHA1 != "" {
+			saved -= saved % f.ChunkSize
+		}
+		return stagedCache{bytes: saved}, nil
 	}
 	pieces, saved, err := resumableParts(root, f, options)
 	return stagedCache{bytes: saved, assemble: len(pieces) > 1}, err
@@ -599,6 +604,9 @@ func sameStagedFile(before, after os.FileInfo) bool {
 }
 
 func (d downloader) fetchFile(ctx context.Context, f resource, part string, offset int64, progress *fileProgress) (bool, error) {
+	if f.NexonSHA1 != "" {
+		return d.fetchNexonFile(ctx, f, part, offset, progress)
+	}
 	if offset <= 0 && canSplitFile(f, d.options) {
 		pieces, _, err := resumableParts(d.root, f, d.options)
 		if err != nil {
@@ -1055,6 +1063,8 @@ var crc64XZ = crc64.MakeTable(crc64.ECMA)
 
 func (f resource) newHash() hash.Hash {
 	switch {
+	case f.NexonSHA1 != "":
+		return &nexonHash{chunk: sha1.New(), chunkSize: int(f.ChunkSize)}
 	case f.SHA256 != "":
 		return sha256.New()
 	case f.MD5 != "":
@@ -1069,7 +1079,7 @@ func (f resource) matchesHash(h hash.Hash) bool {
 }
 
 func (f resource) digest() string {
-	return cmp.Or(f.SHA256, f.MD5, f.CRC64)
+	return cmp.Or(f.NexonSHA1, f.SHA256, f.MD5, f.CRC64)
 }
 
 func sha256File(ctx context.Context, root *os.Root, name string) (string, error) {

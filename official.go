@@ -25,24 +25,38 @@ import (
 	"time"
 )
 
-// Anonymous distribution settings from the official Windows launcher 1.0.1.1.
 const (
-	launcherVersion = "1.0.1.1"
-	launcherID      = "93cdd43e096046138053253dc56d3562"
-	launcherAppID   = "354"
-	launcherChannel = "C000"
-	launcherSalt    = "20bccb31-fb57-4683-b6d8-6314d43811f2"
-	indexKey        = "mJ9dH2bR7fT1zW4eQ6cY8a=="
-	indexIV         = "aP3sD8fG0hJ6kL9z"
-)
-
-const (
+	indexKey         = "mJ9dH2bR7fT1zW4eQ6cY8a=="
+	indexIV          = "aP3sD8fG0hJ6kL9z"
 	officialVersion  = "/pc-launcher/client/gameversion/config"
 	officialPackages = "/pc-launcher/client/gameversion/packageconfig"
 	maxIndexBytes    = 64 << 20
 )
 
-var officialOrigins = []string{"https://api-grp.manjuu.com", "https://api-grp-l2.manjuu.com"}
+type officialLauncher struct {
+	version, id, appID, channel, salt, language string
+	origins                                     []string
+}
+
+// These distribution settings come from the official Windows launchers.
+var cnLauncher = officialLauncher{
+	version: "1.0.1.1", id: "93cdd43e096046138053253dc56d3562",
+	appID: "354", channel: "C000", salt: "20bccb31-fb57-4683-b6d8-6314d43811f2", language: "zh-Hans",
+	origins: []string{"https://api-grp.manjuu.com", "https://api-grp-l2.manjuu.com"},
+}
+
+var twLauncher = officialLauncher{
+	version: "1.0.2.2", id: "1a3ee4447516436a9ec4b5d1ec1635e2",
+	appID: "434", channel: "C500", salt: "13236ff1-87c6-4331-9175-7b7bcaba7942", language: "zh-Hant",
+	origins: []string{"https://api-grp-rgn1.jimi-global.com", "https://l2-api-grp-rgn1.jimi-global.com"},
+}
+
+func (r gameRegion) launcher() officialLauncher {
+	if r == regionTW {
+		return twLauncher
+	}
+	return cnLauncher
+}
 
 type packageConfig struct {
 	Code *int `json:"code"`
@@ -73,10 +87,10 @@ type gamePackage struct {
 	CDNs []string `json:"cdnBaseUrls,omitempty"`
 }
 
-func latestManifest(ctx context.Context, client *http.Client) (manifest, error) {
+func (launcher officialLauncher) latestManifest(ctx context.Context, client *http.Client) (manifest, error) {
 	metadata := *client
 	metadata.Timeout = 45 * time.Second
-	release, err := queryOfficial(ctx, &metadata, officialPackages)
+	release, err := launcher.query(ctx, &metadata, officialPackages)
 	if err != nil {
 		return manifest{}, err
 	}
@@ -129,13 +143,13 @@ func signParams(params url.Values) string {
 	return text.String()
 }
 
-func queryOfficial(ctx context.Context, client *http.Client, endpoint string) (gameRelease, error) {
-	query := url.Values{"launcherId": {launcherID}}
+func (launcher officialLauncher) query(ctx context.Context, client *http.Client, endpoint string) (gameRelease, error) {
+	query := url.Values{"launcherId": {launcher.id}}
 	if endpoint == officialPackages {
 		query.Set("uid", "")
 	}
 	timestamp := strconv.FormatInt(time.Now().UnixMilli(), 10)
-	digest := md5.Sum([]byte(timestamp + signParams(query) + launcherAppID + launcherChannel + launcherSalt))
+	digest := md5.Sum([]byte(timestamp + signParams(query) + launcher.appID + launcher.channel + launcher.salt))
 
 	var ids [32]byte
 	rand.Read(ids[:])
@@ -145,15 +159,15 @@ func queryOfficial(ctx context.Context, client *http.Client, endpoint string) (g
 		"sign":                      hex.EncodeToString(digest[:]),
 		"device-id":                 hex.EncodeToString(ids[:16]),
 		"grp-trace-id":              trace,
-		"grp-app-id":                launcherAppID,
+		"grp-app-id":                launcher.appID,
 		"grp-platform":              "Launcher",
-		"grp-channel-code":          launcherChannel,
+		"grp-channel-code":          launcher.channel,
 		"grp-sub-channel-code":      "SC000",
-		"sdk-version":               launcherVersion,
-		"channel-sdk-version":       launcherVersion,
-		"grp-launcher-version-code": launcherVersion,
-		"lang":                      "zh-Hans",
-		"grp-client-info":           fmt.Sprintf(`{"device_model":"Launcher","device_os":"Linux","app_version":%q,"grp_trace_id":%q,"spec_device_info":{}}`, launcherVersion, trace),
+		"sdk-version":               launcher.version,
+		"channel-sdk-version":       launcher.version,
+		"grp-launcher-version-code": launcher.version,
+		"lang":                      launcher.language,
+		"grp-client-info":           fmt.Sprintf(`{"device_model":"Launcher","device_os":"Linux","app_version":%q,"grp_trace_id":%q,"spec_device_info":{}}`, launcher.version, trace),
 	}
 
 	// Keep the signed request on the configured official origins.
@@ -163,7 +177,7 @@ func queryOfficial(ctx context.Context, client *http.Client, endpoint string) (g
 	}
 	noRedirect.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 	var failure error
-	for _, origin := range officialOrigins {
+	for _, origin := range launcher.origins {
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, origin+endpoint+"?"+query.Encode(), nil)
 		if err != nil {
 			return gameRelease{}, err
